@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+<title>Atmosphere Rendering</title>
+<link type="text/css" href="webgl-tutorials.css" rel="stylesheet">
+</head>
+
+<body>
+<canvas id="canvas" width="1200" height="900"></canvas>
+<div id="uiContainer">
+    <div id="ui"></div> 
+    <input type="button" id="reset" value="Reset To Defaults" style="pointer-events: auto;"></input>
+</div>
+
+<script src="webgl-utils.js"></script>
+<script src="webgl-lessons-ui.js"></script>
+
+<script id="main-vertex-shader" type="x-shader/x-vertex">#version 300 es
+    in vec4 Position;
+    
+    uniform float SunAltitude;
+    uniform float SunAzimuth;
+    uniform float CameraAltitude;
+    uniform vec2 FoV;
+    
+    out vec3 ray;
+    out vec3 sunDir;
+    out vec2 uv;
+    
+    void main() {
+        uv = Position.xy * 0.5 + 0.5;
+        float cView = cos(CameraAltitude);
+        float sView = sin(CameraAltitude);
+        mat3 rotViewAngle = mat3(1.0, 0.0, 0.0, 
+                                0.0, cView, -sView, 
+                                0.0, sView, cView);
+    
+        vec2 c = cos(FoV.xy * 0.5 * Position.xy);
+        vec2 s = sin(FoV.xy * 0.5 * Position.xy);
+        mat3 rotOverY = mat3(c.x, 0.0, s.x,
+                                0.0, 1.0, 0.0,
+                                -s.x, 0.0, c.x);
+        mat3 rotOverX = mat3(1.0, 0.0, 0.0,
+                                0.0, c.y, -s.y,
+                                0.0, s.y, c.y);
+    
+        gl_Position = Position;
+        ray = rotViewAngle * rotOverY * rotOverX * vec3(0, 0, 1);
+    
+        c = cos(vec2(SunAzimuth, SunAltitude));
+        s = sin(vec2(SunAzimuth, SunAltitude));
+        rotOverY = mat3(c.x, 0.0, s.x,
+                                0.0, 1.0, 0.0,
+                                -s.x, 0.0, c.x);
+        rotOverX = mat3(1.0, 0.0, 0.0,
+                                0.0, c.y, -s.y,
+                                0.0, s.y, c.y);
+        sunDir = rotOverY * rotOverX * vec3(0, 0, 1);
+    }
+</script>
+
+<script id="main-fragment-shader" type="x-shader/x-fragment">#version 300 es
+    precision highp float;
+    
+    in vec3 ray;
+    in vec3 sunDir;
+    in vec2 uv;
+    
+    uniform sampler2D TransmittanceLUTTexture;
+    uniform sampler2D MultipleScatteringTexture;
+    
+    uniform float CameraHeight;
+
+    uniform vec3 RayleighScattering;
+    uniform vec3 OzoneAbsorption;
+    
+    out vec4 OutputColor;
+    
+    const float rPlanet = 6360.0;
+    const float rAtmosphere = rPlanet + 100.0;
+    
+    const vec4 planet = vec4(0.0, 0.0, 0.0, rPlanet);
+    const vec4 atmosphere = vec4(0.0, 0.0, 0.0, rAtmosphere);
+    
+    const float sunDist = 150e6;
+    const float sunRadius = 696340.0;
+    
+    const float pi = 3.14159265358979323846;
+
+    const float heightRayleigh = 8.0;
+    const float heightMie = 1.2;
+    const vec3 scatteringMie = vec3(3.996e-3);
+    const vec3 absorptionMie = vec3(4.40e-3);
+
+    const int NumRenderingPlanetSamples = 30;
+    const int NumRenderingSpaceSamples = 100;
+    
+    vec2 sphIntersect(in vec3 ro, in vec3 rd, in vec4 sph) {
+        vec3 oc = ro - sph.xyz;
+        float b = dot(oc, rd);
+        float c = dot(oc, oc) - sph.w*sph.w;
+        float h = b*b - c;
+        if (h < 0.0) return vec2(-1.0, -1.0);
+        return vec2(-b - sqrt(h), -b + sqrt(h));
+    }
+    
+    vec3 transmittance(vec3 p) {
+        vec3 up = normalize(p);
+        float viewHeight = length(p);
+        float viewZenithCosAngle = distance(sunDir, up) < 0.01 ? 1.0 : dot(sunDir, up);
+    
+        float H = sqrt(max(0.0, rAtmosphere * rAtmosphere - rPlanet * rPlanet));
+        float rho = sqrt(max(0.0, viewHeight * viewHeight - rPlanet * rPlanet));
+        float discriminant = viewHeight * viewHeight * (viewZenithCosAngle * viewZenithCosAngle - 1.0) +
+            rAtmosphere * rAtmosphere;
+        float d = max(0.0, -viewHeight * viewZenithCosAngle + sqrt(discriminant));
+        float d_min = rAtmosphere - viewHeight;
+        float d_max = rho + H;
+        float x_mu = (d - d_min) / (d_max - d_min);
+        float x_r = rho / H;
+    
+        return texture(TransmittanceLUTTexture, vec2(x_mu, x_r)).rgb;
+    }
+    
+    struct ScatteringResult {
+        vec3 L;
+        vec3 transmittanceToPoint;
+    };
+    
+    ScatteringResult integrate(in vec3 ro, in vec3 rd, in float t1, in float t2, in int samples) {
+        ScatteringResult result = ScatteringResult(vec3(0.0), vec3(1.0));
+    
+        vec3 scatteringRayleigh = RayleighScattering;
+        vec3 absorptionOzone = OzoneAbsorption;
+
+        float dt = (t2 - t1) / float(samples);
+        vec3 p = ro + rd * t1;
+        float t = t1;
+    
+        vec4 sun = vec4(sunDir * sunDist, sunRadius);
+        vec3 s = normalize(sun.xyz);
+    
+        float cosTheta = dot(s, rd);
+        
+        float phaseRayleigh = 3.0 * (1.0 + cosTheta * cosTheta) / (16.0 * pi);
+        float phaseMie = 3.0 / (8.0 * pi) * (1.0 - 0.8 * 0.8) * (1.0 + cosTheta * cosTheta) /
+            ((2.0 + 0.8 * 0.8) * pow(1.0 + 0.8 * 0.8 - 2.0 * 0.8 * cosTheta, 3.0 / 2.0));
+    
+        for (int i = 0; i < samples; ++i) {
+            float newT = (t2 - t1) * float(i) / float(samples);
+            dt = newT - t;
+            t = newT;
+            p = ro + rd * t;
+    
+            vec2 tPlanet = sphIntersect(p, s, planet);
+            float planetShadow = tPlanet.x > 0.0 ? 0.0 : 1.0;
+    
+            float altitude = length(p) - rPlanet;
+    
+            // Calculate the total extinction
+            vec3 extinctionRayleigh = scatteringRayleigh * exp(-altitude / heightRayleigh);
+            vec3 extinctionMie = (scatteringMie + absorptionMie) * exp(-altitude / heightMie);
+            float tentOzone = max(0.0, 1.0 - abs(altitude - 25.0) / 15.0);
+            vec3 extinctionOzone = absorptionOzone * tentOzone;
+            vec3 extinction = (extinctionRayleigh + extinctionMie + extinctionOzone);
+    
+            // Calculate the amount of light scattered via rayleigh and mie scattering
+            vec3 rayleigh = scatteringRayleigh * exp(-altitude / heightRayleigh) * phaseRayleigh;
+            vec3 mie = scatteringMie * exp(-altitude / heightMie) * phaseMie;
+            vec3 scattering = scatteringRayleigh * exp(-altitude / heightRayleigh) + scatteringMie * exp(-altitude / heightMie);
+
+            // Lookup the multiple scattering buffer
+            vec3 up = normalize(p);
+            float viewHeight = length(p);
+            float viewZenithCosAngle = dot(sunDir, up);
+            vec2 multipleScatteringUV = vec2(viewZenithCosAngle * 0.5 + 0.5, (viewHeight - rPlanet) / (rAtmosphere - rPlanet));
+            vec3 multipleScattering = texture(MultipleScatteringTexture, multipleScatteringUV).rgb;
+    
+            // Lookup the transmittance from the point to the sun
+            vec3 transmittanceToSun = transmittance(p);
+            // Calculate the contribution from single + multiple scattering
+            vec3 L_ = planetShadow * transmittanceToSun * (rayleigh + mie) +  multipleScattering * scattering;
+            // Calculate the light scattered towards the observer
+            result.L += result.transmittanceToPoint * L_ * dt;
+            // Accumulate the transmittance from the observer to the point
+            result.transmittanceToPoint *= exp(-extinction * dt);
+        }
+    
+        return result;
+    }
+    
+    vec3 postProcess(in vec3 color) {
+        vec3 whitePoint = vec3(1.08241, 0.96756, 0.95003);
+        float exposure = 10.0;
+        return pow(1.0 - exp(-color / whitePoint * exposure), vec3(1.0 / 2.2));
+    }
+    
+    void main() {
+        vec3 ro = vec3(0.0, rPlanet + CameraHeight, 0.0);
+        vec3 rd = normalize(ray);
+    
+        vec4 sun = vec4(sunDir * sunDist, sunRadius);
+    
+        vec2 tPlanet = sphIntersect(ro, rd, planet);
+        vec2 tAtmosphere = sphIntersect(ro, rd, atmosphere);
+        vec2 tSun = sphIntersect(ro, rd, sun);
+    
+        // ray hits the atmosphere and then hits the planet
+        if (tPlanet.x > 0.0) {
+            float t1 = 0.0;
+            if (tAtmosphere.x > 0.0) t1 = tAtmosphere.x;
+            float t2 = tPlanet.x;
+    
+            ScatteringResult result = integrate(ro, rd, t1, t2, NumRenderingPlanetSamples);
+    
+            OutputColor = vec4(postProcess(result.L), 1.0);
+            return;
+        }
+    
+        // ray hits the sun
+        if (tSun.x > 0.0) {
+            OutputColor = vec4(1.0);
+            return;
+        }
+    
+        // ray hits the atmosphere and goes out to space
+        if (tAtmosphere.y > 0.0) {
+            float t1 = 0.0;
+            if (tAtmosphere.x > 0.0) t1 = tAtmosphere.x;
+            float t2 = tAtmosphere.y;
+    
+            ScatteringResult result = integrate(ro, rd, t1, t2, NumRenderingSpaceSamples);
+    
+            OutputColor = vec4(postProcess(result.L), 1.0);
+            return;
+        }
+            
+        OutputColor = vec4(0.0, 0.0, 0.0, 1.0);
+    }
+</script>
+
+<script id="fullscreen-vertex-shader" type="x-shader/x-vertex">#version 300 es
+    in vec4 Position;
+    
+    out vec2 uv;
+    
+    void main() {
+        uv = Position.xy * 0.5 + 0.5;
+        gl_Position = Position;
+    }
+</script>
+
+<script id="transmittance-fragment-shader" type="x-shader/x-fragment">#version 300 es
+    precision highp float;
+    
+    in vec2 uv;
+
+    uniform vec3 RayleighScattering;
+    uniform vec3 OzoneAbsorption;
+    
+    const float rPlanet = 6360.0;
+    const float rAtmosphere = rPlanet + 100.0;
+    
+    const vec4 atmosphere = vec4(0.0, 0.0, 0.0, rAtmosphere);
+    
+    const float heightRayleigh = 8.0;
+    const float heightMie = 1.2;
+    const vec3 scatteringMie = vec3(3.996e-3);
+    const vec3 absorptionMie = vec3(4.40e-3);
+
+    const int NumTransmittanceSamples = 40;
+
+    out vec4 OutputColor;
+    
+    vec2 sphIntersect(in vec3 ro, in vec3 rd, in vec4 sph) {
+        vec3 oc = ro - sph.xyz;
+        float b = dot(oc, rd);
+        float c = dot(oc, oc) - sph.w*sph.w;
+        float h = b*b - c;
+        if (h < 0.0) return vec2(-1.0, -1.0);
+        return vec2(-b - sqrt(h), -b + sqrt(h));
+    }
+    
+    vec3 integrate(in vec3 ro, in vec3 rd, in float t1, in float t2, in int samples) {
+        vec3 color = vec3(0.0);
+    
+        vec3 scatteringRayleigh = RayleighScattering;
+        vec3 absorptionOzone = OzoneAbsorption;
+
+        float dt = (t2 - t1) / float(samples);
+        vec3 p = ro + rd * t1;
+        float t = t1;
+    
+        for (int i = 0; i < samples; ++i) {
+            float newT = (t2 - t1) * float(i) / float(samples);
+            dt = newT - t;
+            t = newT;
+            p = ro + rd * t;
+    
+            float altitude = length(p) - rPlanet;
+    
+            // Calculate the total extinction
+            vec3 extinctionRayleigh = scatteringRayleigh * exp(-altitude / heightRayleigh);
+            vec3 extinctionMie = (scatteringMie + absorptionMie) * exp(-altitude / heightMie);
+            float tentOzone = max(0.0, 1.0 - abs(altitude - 25.0) / 15.0);
+            vec3 extinctionOzone = absorptionOzone * tentOzone;
+            vec3 extinction = (extinctionRayleigh + extinctionMie + extinctionOzone);
+    
+            // Accumulate the extinction
+            color += extinction * dt;
+        }
+    
+        return color;
+    }
+    
+    void main() {
+        float x_mu = uv.x;
+        float x_r = uv.y;
+        float H = sqrt(rAtmosphere * rAtmosphere - rPlanet * rPlanet);
+        float rho = H * x_r;
+        
+        float viewHeight = sqrt(rho * rho + rPlanet * rPlanet);
+    
+        float d_min = rAtmosphere - viewHeight;
+        float d_max = rho + H;
+        float d = d_min + x_mu * (d_max - d_min);
+        float viewZenithCosAngle = d == 0.0 ? 1.0 : (H * H - rho * rho - d * d) / (2.0 * viewHeight * d);
+        viewZenithCosAngle = clamp(viewZenithCosAngle, -1.0, 1.0);
+    
+        vec3 ro = vec3(0.0, 0.0, viewHeight);
+        vec3 rd = vec3(0.0, sqrt(1.0 - viewZenithCosAngle * viewZenithCosAngle), viewZenithCosAngle);
+    
+        vec2 tAtmosphere = sphIntersect(ro, rd, atmosphere);
+    
+        // ray hits the atmosphere
+        if (tAtmosphere.y > 0.0) {
+            float t1 = 0.0;
+            float t2 = tAtmosphere.y;
+    
+            vec3 integral = integrate(ro, rd, t1, t2, NumTransmittanceSamples);
+            // The transmittance is given by exp(-extinction)
+            OutputColor = vec4(exp(-integral), 1.0);
+            return;
+        }
+    
+        OutputColor = vec4(0.0, 0.0, 0.0, 1.0);
+    }
+</script>
+
+<script id="multiscattering-fragment-shader" type="x-shader/x-fragment">#version 300 es
+    precision highp float;
+    
+    in vec2 uv;
+    
+    uniform sampler2D TransmittanceLUTTexture;
+    uniform vec3 RayleighScattering;
+    uniform vec3 OzoneAbsorption;
+    
+    out vec4 OutputColor;
+    
+    const float rPlanet = 6360.0;
+    const float rAtmosphere = rPlanet + 100.0;
+    
+    const vec4 planet = vec4(0.0, 0.0, 0.0, rPlanet);
+    const vec4 atmosphere = vec4(0.0, 0.0, 0.0, rAtmosphere);
+    
+    const float pi = 3.14159265358979323846;
+    
+    const float heightRayleigh = 8.0;
+    const float heightMie = 1.2;
+    const vec3 scatteringMie = vec3(3.996e-3);
+    const vec3 absorptionMie = vec3(4.40e-3);
+
+    const int NumMultipleScatteringPlanetSamples = 40;
+    const int NumMultipleScatteringSpaceSamples = 40;
+
+    vec2 sphIntersect(in vec3 ro, in vec3 rd, in vec4 sph) {
+        vec3 oc = ro - sph.xyz;
+        float b = dot(oc, rd);
+        float c = dot(oc, oc) - sph.w*sph.w;
+        float h = b*b - c;
+        if (h < 0.0) return vec2(-1.0, -1.0);
+        return vec2(-b - sqrt(h), -b + sqrt(h));
+    }
+    
+    struct ScatteringResult {
+        vec3 L;
+        vec3 MultiScatt;
+        vec3 transmittanceToPoint;
+    };
+    
+    vec3 transmittance(vec3 p, vec3 sunDir) {
+        vec3 up = normalize(p);
+        float viewHeight = length(p);
+        float viewZenithCosAngle = dot(sunDir, up);
+    
+        float H = sqrt(max(0.0, rAtmosphere * rAtmosphere - rPlanet * rPlanet));
+        float rho = sqrt(max(0.0, viewHeight * viewHeight - rPlanet * rPlanet));
+        float discriminant = viewHeight * viewHeight * (viewZenithCosAngle * viewZenithCosAngle - 1.0) +
+            rAtmosphere * rAtmosphere;
+        float d = max(0.0, -viewHeight * viewZenithCosAngle + sqrt(discriminant));
+        float d_min = rAtmosphere - viewHeight;
+        float d_max = rho + H;
+        float x_mu = (d - d_min) / (d_max - d_min);
+        float x_r = rho / H;
+    
+        return texture(TransmittanceLUTTexture, vec2(x_mu, x_r)).rgb;
+    }
+    
+    ScatteringResult integrate(in vec3 ro, in vec3 rd, vec3 sunDir, in float t1, in float t2, in int samples) {
+        ScatteringResult result = ScatteringResult(vec3(0.0), vec3(0.0), vec3(1.0));
+    
+        vec3 scatteringRayleigh = RayleighScattering;
+        vec3 absorptionOzone = OzoneAbsorption;
+
+        float dt = (t2 - t1) / float(samples);
+        vec3 p = ro + rd * t1;
+        float t = t1;
+    
+        // Isotropic phase functions
+        float phaseRayleigh = 1.0 / (4.0 * pi);
+        float phaseMie = 1.0 / (4.0 * pi);
+    
+        for (int i = 0; i < samples; ++i) {
+            float newT = (t2 - t1) * float(i) / float(samples);
+            dt = newT - t;
+            t = newT;
+            p = ro + rd * t;
+    
+            vec2 tPlanet = sphIntersect(p, sunDir, planet);
+            float planetShadow = tPlanet.x > 0.0 ? 0.0 : 1.0;
+    
+            float altitude = length(p) - rPlanet;
+    
+            // Calculate the total extinction
+            vec3 extinctionRayleigh = scatteringRayleigh * exp(-altitude / heightRayleigh);
+            vec3 extinctionMie = (scatteringMie + absorptionMie) * exp(-altitude / heightMie);
+            float tentOzone = max(0.0, 1.0 - abs(altitude - 25.0) / 15.0);
+            vec3 extinctionOzone = absorptionOzone * tentOzone;
+            vec3 extinction = (extinctionRayleigh + extinctionMie + extinctionOzone);
+    
+            // Calculate the amount of light scattered via rayleigh and mie scattering
+            vec3 rayleigh = scatteringRayleigh * exp(-altitude / heightRayleigh) * phaseRayleigh;
+            vec3 mie = scatteringMie * exp(-altitude / heightMie) * phaseMie;
+            vec3 scattering = scatteringRayleigh * exp(-altitude / heightRayleigh) + scatteringMie * exp(-altitude / heightMie);
+
+            // Multiple scattering approximation
+            vec3 MSint = (scattering - scattering * exp(-extinction * dt)) / extinction;
+            result.MultiScatt += result.transmittanceToPoint * MSint;
+
+            // Lookup the transmittance from the point to the sun
+            vec3 transmittanceToSun = transmittance(p, sunDir);
+            // Calculate the light scattered towards the observer
+            result.L += planetShadow * result.transmittanceToPoint * transmittanceToSun * (rayleigh + mie) * dt;
+            // Accumulate the transmittance from the observer to the point
+            result.transmittanceToPoint *= exp(-extinction * dt);
+        }
+    
+        return result;
+    }
+    
+    void main() {
+        float viewZenithCosAngle = uv.x * 2.0 - 1.0;
+        vec3 sunDir = vec3(0.0, sqrt(1.0 - viewZenithCosAngle * viewZenithCosAngle), viewZenithCosAngle);
+        float viewHeight = rPlanet + clamp((1.0 - uv.y) + 0.01, 0.0, 1.0) * (rAtmosphere - rPlanet - 0.01);
+    
+        vec3 L = vec3(0.0);
+        vec3 MultiScatt = vec3(0.0);
+    
+        float dt = 4.0 * pi / 64.0;
+    
+        vec3 ro = vec3(0.0, 0.0, viewHeight);        
+        for (float i = 0.0; i < 8.0; i += 1.0) {
+            for (float j = 0.0; j < 8.0; j += 1.0) {
+                float randA = (0.5 + i) / 8.0;
+                float randB = (0.5 + j) / 8.0;
+                float theta = 2.0 * pi * randA;
+                float phi = acos(1.0 - 2.0 * randB);
+    
+                float cosTheta = cos(theta);
+                float sinTheta = sin(theta);
+                float cosPhi = cos(phi);
+                float sinPhi = sin(phi);
+    
+                vec3 rd = vec3(cosTheta * sinPhi, sinTheta * sinPhi, cosPhi);
+    
+                vec2 tPlanet = sphIntersect(ro, rd, planet);
+                vec2 tAtmosphere = sphIntersect(ro, rd, atmosphere);
+    
+                // ray hits the atmosphere and then hits the planet
+                if (tPlanet.x > 0.0) {
+                    float t1 = 0.0;
+                    float t2 = tPlanet.x;
+    
+                    ScatteringResult result = integrate(ro, rd, sunDir, t1, t2, NumMultipleScatteringPlanetSamples);
+    
+                    vec3 n = normalize(ro + rd * t2);
+                    float cosTheta = max(dot(n, sunDir), 0.0);
+                    vec3 transmittanceToSun = transmittance(ro + rd * t2, sunDir);
+                    vec3 earthL = result.transmittanceToPoint * cosTheta * vec3(0.3) * transmittanceToSun / pi;
+    
+                    L += (result.L + earthL) * dt;
+                    MultiScatt += result.MultiScatt * dt;
+    
+                    continue;
+                }
+    
+                // ray hits the atmosphere and goes out to space
+                if (tAtmosphere.y > 0.0) {
+                    float t1 = 0.0;
+                    float t2 = tAtmosphere.y;
+    
+                    ScatteringResult result = integrate(ro, rd, sunDir, t1, t2, NumMultipleScatteringSpaceSamples);
+                    L += result.L * dt;
+                    MultiScatt += result.MultiScatt * dt;
+                }
+            }
+        }
+    
+        float phase = 1.0 / (4.0 * pi);
+        L *= phase;
+        MultiScatt *= phase;
+    
+        L *= 1.0 / (1.0 - MultiScatt);
+    
+        OutputColor = vec4(L, 1.0);
+    }
+</script>
+
+<script>
+"use strict";
+
+var cameraHeight = 5;
+var cameraAltitude = 0;
+var sunAltitude = 2;
+var sunAzimuth = 0;
+var fov = 50;
+var marsAtmosphere = 0;
+
+var transmittanceWidth = 256;
+var transmittanceHeight = 64;
+var multipleScatteringWidth = 32;
+var multipleScatteringHeight = 32;
+
+var canvas, gl, mainProgram, transmittanceLUTTexture, transmittanceFB, transmittanceProgram, 
+    multipleScatteringLUTTexture, multipleScatteringFB, multipleScatteringProgram;
+
+function DegToRad(d) {
+    return d * Math.PI / 180;
+}
+
+function AddSlider(name, id, func, min, max, step, value) {
+    var ui = document.getElementById("ui");
+    if (ui === undefined) return;
+
+    var div = document.createElement("div");
+    div.id = id;
+    var outer = document.createElement("div");
+    outer.className = "gman-widget-outer";
+    var label = document.createElement("div");
+    label.className = "gman-widget-label";
+    var val = document.createElement("div");
+    val.className = "gman-widget-value";
+    val.innerHTML = value;
+    var slider = document.createElement("input");
+    slider.className = "gman-widget-slider";
+    slider.type = "range";
+    slider.min = min;
+    slider.max = max;
+    slider.value = value;
+    outer.appendChild(label);
+    outer.appendChild(val);
+    outer.appendChild(slider);
+    div.appendChild(outer);
+    ui.appendChild(div);
+
+    webglLessonsUI.setupSlider("#" + id, {
+        value: value, 
+        slide: func, 
+        min: min, 
+        max: max,
+        step: step
+    });
+
+    var slider = document.getElementById(id);
+    label = slider.getElementsByClassName("gman-widget-label")[0];
+    label.innerHTML = name;
+}
+
+function SetUniform1i(mainProgram, location, value) {
+    var uniformLocation = gl.getUniformLocation(mainProgram, location);
+    gl.uniform1i(uniformLocation, value);
+}
+
+function SetUniform1f(mainProgram, location, value) {
+    var uniformLocation = gl.getUniformLocation(mainProgram, location);
+    gl.uniform1f(uniformLocation, value);
+}
+
+function SetUniform2f(mainProgram, location, valueA, valueB) {
+    var uniformLocation = gl.getUniformLocation(mainProgram, location);
+    gl.uniform2f(uniformLocation, valueA, valueB);
+}
+
+function SetUniform3f(mainProgram, location, valueA, valueB, valueC) {
+    var uniformLocation = gl.getUniformLocation(mainProgram, location);
+    gl.uniform3f(uniformLocation, valueA, valueB, valueC);
+}
+
+function SetupScene() {
+    canvas = document.querySelector("#canvas");
+    gl = canvas.getContext("webgl2");
+
+    mainProgram = webglUtils.createProgramFromScripts(gl, ["main-vertex-shader", "main-fragment-shader"]);
+    var positionAttributeLocation = gl.getAttribLocation(mainProgram, "Position");
+
+    var vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+
+    var positionBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    var positions = new Float32Array([
+        -1, -1, 0,
+        1, -1, 0,
+        1, 1, 0, 
+
+        -1, -1, 0, 
+        1, 1, 0,
+        -1, 1, 0,
+    ]);
+    gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+
+    gl.enableVertexAttribArray(positionAttributeLocation);
+    gl.vertexAttribPointer(positionAttributeLocation, 3, gl.FLOAT, false, 3 * 4, 0);
+
+    gl.getExtension("EXT_color_buffer_float");
+    gl.getExtension("EXT_color_buffer_half_float");
+
+    transmittanceLUTTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, transmittanceLUTTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, transmittanceWidth, transmittanceHeight, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+
+    transmittanceFB = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, transmittanceFB);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, transmittanceLUTTexture, 0);
+
+    transmittanceProgram = webglUtils.createProgramFromScripts(gl, ["fullscreen-vertex-shader", "transmittance-fragment-shader"]);
+    gl.bindAttribLocation(transmittanceProgram, positionAttributeLocation, "Position");
+
+    multipleScatteringLUTTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, multipleScatteringLUTTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, multipleScatteringWidth, multipleScatteringHeight, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    multipleScatteringFB = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, multipleScatteringFB);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, multipleScatteringLUTTexture, 0);
+
+    multipleScatteringProgram = webglUtils.createProgramFromScripts(gl, ["fullscreen-vertex-shader", "multiscattering-fragment-shader"]);
+    gl.bindAttribLocation(multipleScatteringProgram, positionAttributeLocation, "Position");
+
+    gl.enable(gl.DEPTH_TEST);
+    gl.enable(gl.CULL_FACE);
+    gl.clearColor(0, 0, 0, 0);
+
+    gl.bindVertexArray(vao);
+}
+
+function DrawScene() {
+    // Precompute transmittance LUT
+    gl.bindFramebuffer(gl.FRAMEBUFFER, transmittanceFB);
+    gl.viewport(0, 0, transmittanceWidth, transmittanceHeight);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    gl.useProgram(transmittanceProgram);
+    if (marsAtmosphere == 0) {
+        SetUniform3f(transmittanceProgram, "RayleighScattering", 5.802e-3, 13.885e-3, 33.1e-3);
+        SetUniform3f(transmittanceProgram, "OzoneAbsorption", 0.650e-3, 1.881e-3, 0.085e-3);
+    } else {
+        SetUniform3f(transmittanceProgram, "RayleighScattering", 19.918e-3, 13.57e-3, 5.75e-3);
+        SetUniform3f(transmittanceProgram, "OzoneAbsorption", 0.0, 0.0, 0.0);
+    }
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // Precompute multiple scattering
+    gl.bindFramebuffer(gl.FRAMEBUFFER, multipleScatteringFB);
+    gl.viewport(0, 0, multipleScatteringWidth, multipleScatteringHeight);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    gl.useProgram(multipleScatteringProgram);
+    gl.bindTexture(gl.TEXTURE_2D, transmittanceLUTTexture);
+    SetUniform1i(multipleScatteringProgram, "TransmittanceLUTTexture", 0);
+    if (marsAtmosphere == 0) {
+        SetUniform3f(multipleScatteringProgram, "RayleighScattering", 5.802e-3, 13.885e-3, 33.1e-3);
+        SetUniform3f(multipleScatteringProgram, "OzoneAbsorption", 0.650e-3, 1.881e-3, 0.085e-3);
+    } else {
+        SetUniform3f(multipleScatteringProgram, "RayleighScattering", 19.918e-3, 13.57e-3, 5.75e-3);
+        SetUniform3f(multipleScatteringProgram, "OzoneAbsorption", 0.0, 0.0, 0.0);
+    }
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // Render atmosphere
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    gl.useProgram(mainProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, transmittanceLUTTexture);
+    SetUniform1i(mainProgram, "TransmittanceLUTTexture", 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, multipleScatteringLUTTexture);
+    SetUniform1i(mainProgram, "MultipleScatteringTexture", 1);
+    SetUniform1f(mainProgram, "CameraHeight", cameraHeight);
+    SetUniform1f(mainProgram, "CameraAltitude", DegToRad(cameraAltitude));
+    SetUniform1f(mainProgram, "SunAltitude", DegToRad(sunAltitude));
+    SetUniform1f(mainProgram, "SunAzimuth", DegToRad(sunAzimuth));
+    SetUniform2f(mainProgram, "FoV", 
+        DegToRad(fov), 2 * Math.atan(Math.tan(DegToRad(fov) / 2) * gl.canvas.height / gl.canvas.width));
+    if (marsAtmosphere == 0) {
+        SetUniform3f(mainProgram, "RayleighScattering", 5.802e-3, 13.885e-3, 33.1e-3);
+        SetUniform3f(mainProgram, "OzoneAbsorption", 0.650e-3, 1.881e-3, 0.085e-3);
+    } else {
+        SetUniform3f(mainProgram, "RayleighScattering", 19.918e-3, 13.57e-3, 5.75e-3);
+        SetUniform3f(mainProgram, "OzoneAbsorption", 0.0, 0.0, 0.0);
+    }
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+
+function UpdateCameraHeight(event, ui) {
+    cameraHeight = ui.value / 10;
+    DrawScene();
+}
+
+function UpdateCamreaAltitude(event, ui) {
+    cameraAltitude = ui.value;
+    DrawScene();
+}
+
+function UpdateSunAltitude(event, ui) {
+    sunAltitude = ui.value;
+    DrawScene();
+}
+
+function UpdateSunAzimuth(event, ui) {
+    sunAzimuth = ui.value;
+    DrawScene();
+}
+
+function UpdateFoV(event, ui) {
+    fov = ui.value;
+    DrawScene();
+}
+
+function UpdateMarsAtmosphere(event, ui) {
+    marsAtmosphere = ui.value;
+    DrawScene();
+}
+
+function ResetToDefault()
+{
+    cameraHeight = 5;
+    document.getElementById("camera-height").getElementsByTagName("input")[0].value = 5;
+    document.getElementById("camera-height").getElementsByClassName("gman-widget-value")[0].innerHTML = 5;
+
+    cameraAltitude = 0;
+    document.getElementById("camera-altitude").getElementsByTagName("input")[0].value = 0;
+    document.getElementById("camera-altitude").getElementsByClassName("gman-widget-value")[0].innerHTML = 0;
+
+    sunAltitude = 2;
+    document.getElementById("sun-altitude").getElementsByTagName("input")[0].value = 2;
+    document.getElementById("sun-altitude").getElementsByClassName("gman-widget-value")[0].innerHTML = 2;
+
+    sunAzimuth = 0;
+    document.getElementById("sun-azimuth").getElementsByTagName("input")[0].value = 0;
+    document.getElementById("sun-azimuth").getElementsByClassName("gman-widget-value")[0].innerHTML = 0;
+
+    fov = 50;
+    document.getElementById("fov").getElementsByTagName("input")[0].value = 50;
+    document.getElementById("fov").getElementsByClassName("gman-widget-value")[0].innerHTML = 50;
+
+    marsAtmosphere = 0;
+    document.getElementById("mars").getElementsByTagName("input")[0].value = 0;
+    document.getElementById("mars").getElementsByClassName("gman-widget-value")[0].innerHTML = 0;
+
+    DrawScene();
+}
+
+AddSlider("Camera Height (km)", "camera-height", UpdateCameraHeight, 1, 1000, 1, cameraHeight);
+AddSlider("Camera Altitude (deg)", "camera-altitude", UpdateCamreaAltitude, -90, 90, 1, cameraAltitude);
+AddSlider("Sun Altitude (deg)", "sun-altitude", UpdateSunAltitude, -20, 89, 0.1, sunAltitude);
+AddSlider("Sun Azimuth (deg)", "sun-azimuth", UpdateSunAzimuth, -180, 180, 1, sunAzimuth);
+AddSlider("FoV", "fov", UpdateFoV, 20, 70, 1, fov);
+AddSlider("Use Mars Coefficients", "mars", UpdateMarsAtmosphere, 0, 1, 1, marsAtmosphere);
+
+document.getElementById("reset").addEventListener("click", ResetToDefault);
+
+SetupScene();
+
+DrawScene();
+</script>
+</body>
+
+</html>
